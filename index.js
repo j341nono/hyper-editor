@@ -86,9 +86,11 @@ exports.decorateTerm = function decorateTerm(Term, {React}) {
       this.containerRef = React.createRef();
       this.queryRef = React.createRef();
       this.view = null;
+      this.termInstance = null;
       this._onKey = this._onKey.bind(this);
       this._onQueryChange = this._onQueryChange.bind(this);
       this._onQueryKey = this._onQueryKey.bind(this);
+      this._onTermDecorated = this._onTermDecorated.bind(this);
     }
 
     componentDidMount() {
@@ -100,11 +102,47 @@ exports.decorateTerm = function decorateTerm(Term, {React}) {
       this._destroyView();
     }
 
+    _onTermDecorated(term) {
+      this.termInstance = term;
+      if (this.props.onDecorated) this.props.onDecorated(term);
+    }
+
     _onKey(e) {
       if (e.ctrlKey && e.shiftKey && e.code === 'KeyE') {
         e.preventDefault();
         e.stopPropagation();
         this.state.isOpen ? this._close() : this._openPicker();
+        return;
+      }
+      if (e.ctrlKey && e.shiftKey && e.code === 'KeyT') {
+        e.preventDefault();
+        e.stopPropagation();
+        this._captureTerminal();
+      }
+    }
+
+    _captureTerminal() {
+      const xterm = this.termInstance && (this.termInstance.term || this.termInstance);
+      if (!xterm || !xterm.buffer) return;
+
+      const buf = xterm.buffer.active;
+      const lines = [];
+      for (let i = 0; i < buf.length; i++) {
+        const line = buf.getLine(i);
+        if (line) lines.push(line.translateToString(true));
+      }
+      while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+      const content = lines.join('\n');
+
+      if (this.state.isOpen && !this.state.showPicker && this.view) {
+        const doc = this.view.state.doc;
+        this.view.dispatch({changes: {from: doc.length, insert: '\n' + content}});
+        this.setState({status: 'Terminal output appended'});
+      } else {
+        this.setState({isOpen: true, showPicker: false, filePath: ''}, () => {
+          this._initView(content);
+          this.setState({status: 'Terminal output captured  |  :w <path> to save'});
+        });
       }
     }
 
@@ -325,7 +363,7 @@ exports.decorateTerm = function decorateTerm(Term, {React}) {
       return React.createElement(
         'div',
         {style: S.root},
-        React.createElement(Term, this.props),
+        React.createElement(Term, Object.assign({}, this.props, {onDecorated: this._onTermDecorated})),
         this.state.isOpen ? this._renderOverlay() : null
       );
     }
@@ -404,7 +442,7 @@ exports.decorateTerm = function decorateTerm(Term, {React}) {
         {style: S.header},
         React.createElement('span', {style: S.badge}, ' HYPER EDITOR '),
         React.createElement('span', {style: S.title}, title),
-        React.createElement('span', {style: S.hint}, 'Ctrl+Shift+E to close')
+        React.createElement('span', {style: S.hint}, 'Ctrl+Shift+E close  ·  Ctrl+Shift+T capture')
       );
     }
   }
