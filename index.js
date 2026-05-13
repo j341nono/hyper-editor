@@ -249,6 +249,28 @@ exports.decorateTerm = function decorateTerm(Term, {React}) {
       }
     }
 
+    // Build a CodeMirror theme from Hyper's live color settings so the editor
+    // matches the terminal's appearance without any manual configuration.
+    _buildHyperTheme() {
+      const {EditorView} = require('@codemirror/view');
+      const p = this.props;
+      const bg  = p.backgroundColor  || '#282c34';
+      const fg  = p.foregroundColor  || '#abb2bf';
+      const cur = p.cursorColor      || '#528bff';
+      const sel = p.selectionColor   || 'rgba(255,255,255,0.15)';
+      return EditorView.theme({
+        '&':                                    {backgroundColor: bg, color: fg, height: '100%', fontSize: '14px'},
+        '.cm-scroller':                         {overflow: 'auto', height: '100%'},
+        '.cm-content':                          {caretColor: cur, fontFamily: 'inherit'},
+        '&.cm-focused .cm-cursor':              {borderLeftColor: cur},
+        '&.cm-focused .cm-selectionBackground': {background: sel},
+        '.cm-selectionBackground':              {background: sel},
+        '.cm-activeLine':                       {backgroundColor: 'rgba(255,255,255,0.04)'},
+        '.cm-gutters':                          {backgroundColor: bg, border: 'none', color: `${fg}66`},
+        '.cm-activeLineGutter':                 {backgroundColor: 'transparent'},
+      });
+    }
+
     _initView(content) {
       if (!this.containerRef.current) return;
       this._destroyView();
@@ -283,12 +305,8 @@ exports.decorateTerm = function decorateTerm(Term, {React}) {
             syntaxHighlighting(defaultHighlightStyle),
             keymap.of([indentWithTab, ...defaultKeymap, ...historyKeymap]),
             oneDark,
+            this._buildHyperTheme(), // Hyper color overrides applied on top of oneDark
             ...this._langExt(this.state.filePath),
-            EditorView.theme({
-              '&': {height: '100%', fontSize: '14px'},
-              '.cm-scroller': {overflow: 'auto', height: '100%'},
-              '.cm-content': {fontFamily: 'inherit'},
-            }),
             EditorView.updateListener.of((update) => {
               if (update.docChanged && self.state.status) self.setState({status: ''});
             }),
