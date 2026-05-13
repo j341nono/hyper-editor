@@ -44,15 +44,6 @@ exports.onWindow = function onWindow() {
 // Redux – inject terminal CWD into term props
 // ──────────────────────────────────────────────────────────────────────────────
 
-exports.mapTermsState = (state, map) =>
-  Object.assign({}, map, {sessions: state.sessions});
-
-exports.getTermProps = (uid, parentProps, props) => {
-  const session = parentProps.sessions && parentProps.sessions[uid];
-  return Object.assign({}, props, {
-    _editorCwd: session ? session.cwd : null,
-  });
-};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Renderer Process – editor overlay
@@ -147,7 +138,7 @@ exports.decorateTerm = function decorateTerm(Term, {React}) {
     }
 
     async _openPicker() {
-      const cwd = this.props._editorCwd || require('os').homedir();
+      const cwd = require('os').homedir();
       const files = await this._listDir(cwd);
       this.setState(
         {isOpen: true, showPicker: true, status: '', query: '', files, pickerCwd: cwd, selectedIdx: 0},
@@ -360,11 +351,18 @@ exports.decorateTerm = function decorateTerm(Term, {React}) {
     }
 
     render() {
+      const termEl = React.createElement(
+        Term,
+        Object.assign({}, this.props, {onDecorated: this._onTermDecorated})
+      );
+      // Only add wrapper div when the overlay is active to avoid interfering
+      // with Hyper's internal terminal layout when the editor is closed.
+      if (!this.state.isOpen) return termEl;
       return React.createElement(
         'div',
         {style: S.root},
-        React.createElement(Term, Object.assign({}, this.props, {onDecorated: this._onTermDecorated})),
-        this.state.isOpen ? this._renderOverlay() : null
+        termEl,
+        this._renderOverlay()
       );
     }
 
