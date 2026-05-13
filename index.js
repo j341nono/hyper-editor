@@ -26,6 +26,32 @@ exports.onWindow = function onWindow() {
     await fs.promises.mkdir(path.dirname(abs), {recursive: true});
     await fs.promises.writeFile(abs, content, 'utf8');
   });
+
+  ipcMain.handle('hyper-editor:list-dir', async (_, dirPath) => {
+    const abs = expand(dirPath || os.homedir());
+    const entries = await fs.promises.readdir(abs, {withFileTypes: true});
+    return entries
+      .filter((e) => !e.name.startsWith('.'))
+      .map((e) => ({name: e.name, isDir: e.isDirectory()}))
+      .sort((a, b) => {
+        if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+        return a.name.localeCompare(b.name);
+      });
+  });
+};
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Redux – inject terminal CWD into term props
+// ──────────────────────────────────────────────────────────────────────────────
+
+exports.mapTermsState = (state, map) =>
+  Object.assign({}, map, {sessions: state.sessions});
+
+exports.getTermProps = (uid, parentProps, props) => {
+  const session = parentProps.sessions && parentProps.sessions[uid];
+  return Object.assign({}, props, {
+    _editorCwd: session ? session.cwd : null,
+  });
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -33,20 +59,36 @@ exports.onWindow = function onWindow() {
 // ──────────────────────────────────────────────────────────────────────────────
 
 exports.decorateTerm = function decorateTerm(Term, {React}) {
+  function fuzzyMatch(name, query) {
+    if (!query) return true;
+    const s = name.toLowerCase();
+    const q = query.toLowerCase();
+    let qi = 0;
+    for (let i = 0; i < s.length && qi < q.length; i++) {
+      if (s[i] === q[qi]) qi++;
+    }
+    return qi === q.length;
+  }
+
   class HyperEditor extends React.PureComponent {
     constructor(props) {
       super(props);
       this.state = {
         isOpen: false,
-        showInput: true,
+        showPicker: true,
         filePath: '',
         status: '',
+        query: '',
+        files: [],
+        pickerCwd: '',
+        selectedIdx: 0,
       };
       this.containerRef = React.createRef();
-      this.inputRef = React.createRef();
+      this.queryRef = React.createRef();
       this.view = null;
       this._onKey = this._onKey.bind(this);
-      this._onInputKey = this._onInputKey.bind(this);
+      this._onQueryChange = this._onQueryChange.bind(this);
+      this._onQueryKey = this._onQueryKey.bind(this);
     }
 
     componentDidMount() {
@@ -58,25 +100,26 @@ exports.decorateTerm = function decorateTerm(Term, {React}) {
       this._destroyView();
     }
 
-    // ── toggle ──────────────────────────────────────────────────────────────
-
     _onKey(e) {
       if (e.ctrlKey && e.shiftKey && e.code === 'KeyE') {
         e.preventDefault();
         e.stopPropagation();
-        this.state.isOpen ? this._close() : this._open();
+        this.state.isOpen ? this._close() : this._openPicker();
       }
     }
 
-    _open() {
-      this.setState({isOpen: true, showInput: true, status: ''}, () => {
-        this.inputRef.current && this.inputRef.current.focus();
-      });
+    async _openPicker() {
+      const cwd = this.props._editorCwd || require('os').homedir();
+      const files = await this._listDir(cwd);
+      this.setState(
+        {isOpen: true, showPicker: true, status: '', query: '', files, pickerCwd: cwd, selectedIdx: 0},
+        () => this.queryRef.current && this.queryRef.current.focus()
+      );
     }
 
     _close() {
       this._destroyView();
-      this.setState({isOpen: false, showInput: true, filePath: '', status: ''});
+      this.setState({isOpen: false, showPicker: true, filePath: '', status: '', query: '', files: []});
     }
 
     _destroyView() {
@@ -86,15 +129,64 @@ exports.decorateTerm = function decorateTerm(Term, {React}) {
       }
     }
 
-    // ── file operations ──────────────────────────────────────────────────────
-
-    _onInputKey(e) {
-      if (e.key === 'Enter') this._loadFile(e.currentTarget.value);
-      else if (e.key === 'Escape') this._close();
+    async _listDir(dir) {
+      try {
+        const {ipcRenderer} = require('electron');
+        return await ipcRenderer.invoke('hyper-editor:list-dir', dir);
+      } catch (_) {
+        return [];
+      }
     }
 
-    async _loadFile(raw) {
-      const filePath = (raw || '').trim();
+    _filtered() {
+      const {files, query} = this.state;
+      return query ? files.filter((f) => fuzzyMatch(f.name, query)) : files;
+    }
+
+    _onQueryChange(e) {
+      this.setState({query: e.target.value, selectedIdx: 0});
+    }
+
+    async _onQueryKey(e) {
+      const filtered = this._filtered();
+      if (e.key === 'Escape') {
+        this._close();
+        return;
+      }
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        this.setState((s) => ({selectedIdx: Math.min(s.selectedIdx + 1, filtered.length - 1)}));
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        this.setState((s) => ({selectedIdx: Math.max(s.selectedIdx - 1, 0)}));
+        return;
+      }
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        const selected = filtered[this.state.selectedIdx];
+        if (selected) {
+          await this._pickItem(selected);
+        } else if (this.state.query.trim()) {
+          this._loadFile(this.state.query.trim());
+        }
+      }
+    }
+
+    async _pickItem(item) {
+      const path = require('path');
+      const fullPath = path.join(this.state.pickerCwd, item.name);
+      if (item.isDir) {
+        const files = await this._listDir(fullPath);
+        this.setState({files, query: '', selectedIdx: 0, pickerCwd: fullPath});
+      } else {
+        this._loadFile(fullPath);
+      }
+    }
+
+    async _loadFile(rawPath) {
+      const filePath = (rawPath || '').trim();
       let content = '';
       if (filePath) {
         try {
@@ -105,10 +197,9 @@ exports.decorateTerm = function decorateTerm(Term, {React}) {
             this.setState({status: `E: ${err.message}`});
             return;
           }
-          // new file – start with empty buffer
         }
       }
-      this.setState({showInput: false, filePath}, () => this._initView(content));
+      this.setState({showPicker: false, filePath}, () => this._initView(content));
     }
 
     async _save(targetPath) {
@@ -130,52 +221,28 @@ exports.decorateTerm = function decorateTerm(Term, {React}) {
       }
     }
 
-    // ── CodeMirror initialisation ────────────────────────────────────────────
-
     _langExt(fp) {
       if (!fp) return [];
       const ext = fp.split('.').pop().toLowerCase();
       try {
         switch (ext) {
-          case 'js': {
-            const {javascript} = require('@codemirror/lang-javascript');
-            return [javascript()];
-          }
+          case 'js':
           case 'jsx': {
             const {javascript} = require('@codemirror/lang-javascript');
-            return [javascript({jsx: true})];
+            return [javascript({jsx: ext === 'jsx'})];
           }
-          case 'ts': {
-            const {javascript} = require('@codemirror/lang-javascript');
-            return [javascript({typescript: true})];
-          }
+          case 'ts':
           case 'tsx': {
             const {javascript} = require('@codemirror/lang-javascript');
-            return [javascript({typescript: true, jsx: true})];
+            return [javascript({typescript: true, jsx: ext === 'tsx'})];
           }
-          case 'json': {
-            const {json} = require('@codemirror/lang-json');
-            return [json()];
-          }
-          case 'css': {
-            const {css} = require('@codemirror/lang-css');
-            return [css()];
-          }
+          case 'json': { const {json}     = require('@codemirror/lang-json');     return [json()];     }
+          case 'css':  { const {css}      = require('@codemirror/lang-css');      return [css()];      }
           case 'html':
-          case 'htm': {
-            const {html} = require('@codemirror/lang-html');
-            return [html()];
-          }
-          case 'md': {
-            const {markdown} = require('@codemirror/lang-markdown');
-            return [markdown()];
-          }
-          case 'py': {
-            const {python} = require('@codemirror/lang-python');
-            return [python()];
-          }
-          default:
-            return [];
+          case 'htm':  { const {html}     = require('@codemirror/lang-html');     return [html()];     }
+          case 'md':   { const {markdown} = require('@codemirror/lang-markdown'); return [markdown()]; }
+          case 'py':   { const {python}   = require('@codemirror/lang-python');   return [python()];   }
+          default:     return [];
         }
       } catch (_) {
         return [];
@@ -185,60 +252,34 @@ exports.decorateTerm = function decorateTerm(Term, {React}) {
     _initView(content) {
       if (!this.containerRef.current) return;
       this._destroyView();
-
       try {
-        const {
-          EditorView,
-          keymap,
-          lineNumbers,
-          drawSelection,
-          highlightActiveLine,
-          highlightActiveLineGutter,
-        } = require('@codemirror/view');
+        const {EditorView, keymap, lineNumbers, drawSelection, highlightActiveLine, highlightActiveLineGutter} =
+          require('@codemirror/view');
         const {EditorState} = require('@codemirror/state');
         const {vim, Vim} = require('@replit/codemirror-vim');
-        const {
-          defaultKeymap,
-          historyKeymap,
-          history,
-          indentWithTab,
-        } = require('@codemirror/commands');
-        const {
-          syntaxHighlighting,
-          defaultHighlightStyle,
-          bracketMatching,
-          indentOnInput,
-        } = require('@codemirror/language');
+        const {defaultKeymap, historyKeymap, history, indentWithTab} = require('@codemirror/commands');
+        const {syntaxHighlighting, defaultHighlightStyle, bracketMatching, indentOnInput} =
+          require('@codemirror/language');
         const {oneDark} = require('@codemirror/theme-one-dark');
-
         const self = this;
 
-        // Define (or re-define) ex commands bound to this instance
         Vim.defineEx('write', 'w', (_, params) => {
-          const fp = params && params.args && params.args[0] ? params.args[0] : null;
-          self._save(fp);
+          self._save(params && params.args && params.args[0] ? params.args[0] : null);
         });
         Vim.defineEx('edit', 'e', (_, params) => {
           if (params && params.args && params.args[0]) self._loadFile(params.args[0]);
         });
         Vim.defineEx('quit', 'q', () => self._close());
         Vim.defineEx('wq', 'wq', async (_, params) => {
-          const fp = params && params.args && params.args[0] ? params.args[0] : null;
-          await self._save(fp);
+          await self._save(params && params.args && params.args[0] ? params.args[0] : null);
           self._close();
         });
 
         const state = EditorState.create({
           doc: content,
           extensions: [
-            vim(),
-            lineNumbers(),
-            history(),
-            drawSelection(),
-            bracketMatching(),
-            indentOnInput(),
-            highlightActiveLine(),
-            highlightActiveLineGutter(),
+            vim(), lineNumbers(), history(), drawSelection(), bracketMatching(),
+            indentOnInput(), highlightActiveLine(), highlightActiveLineGutter(),
             syntaxHighlighting(defaultHighlightStyle),
             keymap.of([indentWithTab, ...defaultKeymap, ...historyKeymap]),
             oneDark,
@@ -249,9 +290,7 @@ exports.decorateTerm = function decorateTerm(Term, {React}) {
               '.cm-content': {fontFamily: 'inherit'},
             }),
             EditorView.updateListener.of((update) => {
-              if (update.docChanged && self.state.status) {
-                self.setState({status: ''});
-              }
+              if (update.docChanged && self.state.status) self.setState({status: ''});
             }),
           ],
         });
@@ -260,11 +299,9 @@ exports.decorateTerm = function decorateTerm(Term, {React}) {
         this.view.focus();
       } catch (err) {
         console.error('[hyper-editor]', err);
-        this.setState({status: `E: Failed to load editor – ${err.message}`});
+        this.setState({status: `E: ${err.message}`});
       }
     }
-
-    // ── render ───────────────────────────────────────────────────────────────
 
     render() {
       return React.createElement(
@@ -276,42 +313,70 @@ exports.decorateTerm = function decorateTerm(Term, {React}) {
     }
 
     _renderOverlay() {
-      const {showInput, filePath, status} = this.state;
+      return this.state.showPicker ? this._renderPicker() : this._renderEditor();
+    }
 
-      if (showInput) {
-        return React.createElement(
+    _renderPicker() {
+      const {query, selectedIdx, status, pickerCwd} = this.state;
+      const filtered = this._filtered();
+      return React.createElement(
+        'div',
+        {style: S.overlay},
+        this._renderHeader(pickerCwd || '~'),
+        React.createElement(
           'div',
-          {style: S.overlay},
-          this._renderHeader('Open File'),
+          {style: S.pickerBody},
           React.createElement(
             'div',
-            {style: S.inputBody},
-            React.createElement(
-              'div',
-              {style: S.inputRow},
-              React.createElement('span', {style: S.inputPrefix}, ':e '),
-              React.createElement('input', {
-                ref: this.inputRef,
-                style: S.input,
-                placeholder: '~/path/to/file   (Enter = empty buffer, Esc = cancel)',
-                onKeyDown: this._onInputKey,
-                spellCheck: false,
-                autoCorrect: 'off',
-                autoCapitalize: 'off',
-              })
-            )
+            {style: S.searchRow},
+            React.createElement('span', {style: S.searchPrompt}, '>'),
+            React.createElement('input', {
+              ref: this.queryRef,
+              style: S.searchInput,
+              placeholder: 'Search files…  (arrows navigate, Enter open, Esc cancel)',
+              value: query,
+              onChange: this._onQueryChange,
+              onKeyDown: this._onQueryKey,
+              spellCheck: false,
+              autoCorrect: 'off',
+              autoCapitalize: 'off',
+            })
+          ),
+          React.createElement(
+            'div',
+            {style: S.fileList},
+            filtered.length === 0
+              ? React.createElement('div', {style: S.emptyMsg}, query ? 'No matches' : 'Empty directory')
+              : filtered.map((f, i) =>
+                  React.createElement(
+                    'div',
+                    {
+                      key: f.name,
+                      style: Object.assign({}, S.fileItem, i === selectedIdx ? S.fileItemActive : {}),
+                      onMouseEnter: () => this.setState({selectedIdx: i}),
+                      onClick: () => this._pickItem(f),
+                    },
+                    React.createElement(
+                      'span',
+                      {style: f.isDir ? S.fileNameDir : S.fileNameFile},
+                      f.name + (f.isDir ? '/' : '')
+                    )
+                  )
+                )
           )
-        );
-      }
+        ),
+        status ? React.createElement('div', {style: S.statusBar}, status) : null
+      );
+    }
 
+    _renderEditor() {
+      const {filePath, status} = this.state;
       return React.createElement(
         'div',
         {style: S.overlay},
         this._renderHeader(filePath || '[No Name]'),
         React.createElement('div', {ref: this.containerRef, style: S.editor}),
-        status
-          ? React.createElement('div', {style: S.statusBar}, status)
-          : null
+        status ? React.createElement('div', {style: S.statusBar}, status) : null
       );
     }
 
@@ -334,11 +399,7 @@ exports.decorateTerm = function decorateTerm(Term, {React}) {
 // ──────────────────────────────────────────────────────────────────────────────
 
 const S = {
-  root: {
-    position: 'relative',
-    width: '100%',
-    height: '100%',
-  },
+  root: {position: 'relative', width: '100%', height: '100%'},
   overlay: {
     position: 'absolute',
     inset: 0,
@@ -355,7 +416,7 @@ const S = {
     padding: '4px 12px',
     background: '#21252b',
     borderBottom: '1px solid #181a1f',
-    fontSize: '18px',
+    fontSize: '13px',
     gap: '12px',
     flexShrink: 0,
     height: '28px',
@@ -375,40 +436,30 @@ const S = {
     overflow: 'hidden',
     textOverflow: 'ellipsis',
     whiteSpace: 'nowrap',
+    color: '#abb2bf',
   },
-  hint: {
-    color: '#5c6370',
-    fontSize: '11px',
-    flexShrink: 0,
-  },
-  editor: {
-    flex: 1,
-    overflow: 'hidden',
-  },
-  inputBody: {
+  hint: {color: '#5c6370', fontSize: '11px', flexShrink: 0},
+  editor: {flex: 1, overflow: 'hidden'},
+  pickerBody: {
     flex: 1,
     display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    padding: '24px',
+    flexDirection: 'column',
+    padding: '16px',
+    gap: '10px',
+    overflow: 'hidden',
   },
-  inputRow: {
+  searchRow: {
     display: 'flex',
     alignItems: 'center',
     background: '#21252b',
     border: '1px solid #3e4451',
     borderRadius: '4px',
     padding: '8px 12px',
-    width: '100%',
-    maxWidth: '640px',
-  },
-  inputPrefix: {
-    color: '#61afef',
-    fontWeight: 'bold',
-    marginRight: '6px',
+    gap: '8px',
     flexShrink: 0,
   },
-  input: {
+  searchPrompt: {color: '#61afef', fontWeight: 'bold', flexShrink: 0},
+  searchInput: {
     flex: 1,
     background: 'transparent',
     border: 'none',
@@ -417,6 +468,18 @@ const S = {
     fontSize: '14px',
     outline: 'none',
   },
+  fileList: {
+    flex: 1,
+    overflowY: 'auto',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '1px',
+  },
+  fileItem: {padding: '5px 10px', borderRadius: '3px', cursor: 'pointer', fontSize: '13px'},
+  fileItemActive: {background: '#3e4451'},
+  fileNameDir: {color: '#61afef'},
+  fileNameFile: {color: '#abb2bf'},
+  emptyMsg: {color: '#5c6370', padding: '12px', textAlign: 'center'},
   statusBar: {
     padding: '2px 12px',
     background: '#21252b',
